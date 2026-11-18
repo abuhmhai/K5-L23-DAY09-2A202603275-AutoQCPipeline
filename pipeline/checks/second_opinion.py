@@ -35,10 +35,81 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    so = cfg["second_opinion"]
+    conf_thr = so["conf"]
+    min_area = so["min_area_px"]
+    fp_conf = so["fp_conf"]
+    iou_missing = so["iou_missing"]
+    iou_match = so["iou_match"]
+    iou_loose = so["iou_loose"]
+    n_classes = len(ds.classes)
+    issues = []
+    for img in ds.image_files():
+        stem = img.stem
+        if stem not in preds:
+            continue
+        raw_lines = ds.read_label_lines(stem)
+        if raw_lines is None:
+            continue
+        size = ds.image_size(stem)
+        width_px, height_px = size if size else (0, 0)
+        labeled = []
+        for line_no, text in raw_lines:
+            try:
+                parsed = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= parsed[0] < n_classes:
+                labeled.append((line_no, *parsed))
+        kept = []
+        for pred in preds[stem] or []:
+            pcls, pconf, cx, cy, w, h = pred[:6]
+            if pconf < conf_thr:
+                continue
+            if (w * width_px) * (h * height_px) < min_area:
+                continue
+            kept.append((int(pcls), float(pconf), cx, cy, w, h))
+        for pcls, pconf, cx, cy, w, h in kept:
+            pbox = (cx, cy, w, h)
+            cands = []
+            for _line, lcls, lx, ly, lw, lh in labeled:
+                iou = iou_xywh(pbox, (lx, ly, lw, lh))
+                if iou >= iou_missing:
+                    cands.append((iou, int(lcls)))
+            same = [iou for iou, lcls in cands if lcls == pcls]
+            other = [iou for iou, lcls in cands if lcls != pcls]
+            if not cands:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                    "model thấy vật mà nhãn không có box", extra={"conf": pconf},
+                ))
+            elif same:
+                best = max(same)
+                if best < iou_loose:
+                    issues.append(Issue(
+                        "second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                        "đúng lớp nhưng box lỏng", extra={"iou": best, "conf": pconf},
+                    ))
+            elif other and max(other) >= iou_match:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                    "cùng vị trí nhưng khác lớp", extra={"iou": max(other), "conf": pconf},
+                ))
+        fp_boxes = [
+            (p[2], p[3], p[4], p[5]) for p in (preds[stem] or []) if p[1] >= fp_conf
+        ]
+        for line_no, _lcls, lx, ly, lw, lh in labeled:
+            lbox = (lx, ly, lw, lh)
+            if all(iou_xywh(lbox, box) < iou_missing for box in fp_boxes):
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                    "box nhãn không khớp vật nào model thấy", line_no,
+                ))
+    return issues

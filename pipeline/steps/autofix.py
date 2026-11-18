@@ -27,13 +27,110 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
+
+DROP_LINE = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_IMAGE = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
+def _clip(cls, cx, cy, w, h):
+    """Cắt box về [0, 1]. Trả None nếu sau cắt không còn diện tích."""
+    x1, y1 = max(0.0, cx - w / 2), max(0.0, cy - h / 2)
+    x2, y2 = min(1.0, cx + w / 2), min(1.0, cy + h / 2)
+    nw, nh = x2 - x1, y2 - y1
+    if nw <= 0 or nh <= 0:
+        return None
+    return int(cls), (x1 + x2) / 2, (y1 + y2) / 2, nw, nh
+
+
+def _row(image, line, action, before, after):
+    return {"image": image, "line": "" if line is None else line, "action": action, "before": before, "after": after}
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    errors = [i for i in issues if i.severity == ERROR]
+    fixes = []
+    removed = set()
+
+    for issue in errors:
+        if issue.code not in REMOVE_IMAGE and not str(issue.code).startswith("DUP_IMAGE_"):
+            continue
+        if issue.image in removed:
+            continue
+        removed.add(issue.image)
+        img = ds.image_path(issue.image)
+        lab = ds.label_path(issue.image)
+        before = img.name if img is not None else issue.image
+        if img is not None and img.exists():
+            img.unlink()
+        if lab.exists():
+            lab.unlink()
+        fixes.append(_row(issue.image, issue.line, "remove_image", before, "(đã xoá)"))
+
+    if any(i.code == "BAD_CLASS_NAME" for i in errors):
+        data = {}
+        if ds.yaml_path.exists():
+            data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+        before = str(data.get("names"))
+        data["names"] = list(cfg["classes"])
+        ds.yaml_path.write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        fixes.append(_row("data.yaml", None, "rename_classes", before, str(list(cfg["classes"]))))
+
+    by_image = defaultdict(list)
+    for issue in errors:
+        if issue.image in removed or issue.line is None:
+            continue
+        if issue.code in DROP_LINE or issue.code == "BOX_OUT_OF_IMAGE":
+            by_image[issue.image].append(issue)
+
+    for stem in sorted(by_image):
+        lab = ds.label_path(stem)
+        if not lab.exists():
+            continue
+        raw_lines = lab.read_text(encoding="utf-8").splitlines()
+        drop_at = set()
+        clip_at = set()
+        for issue in by_image[stem]:
+            if issue.code in DROP_LINE:
+                drop_at.add(issue.line)
+            elif issue.code == "BOX_OUT_OF_IMAGE":
+                clip_at.add(issue.line)
+        clip_at -= drop_at
+        new_lines = []
+        for idx, text in enumerate(raw_lines, 1):
+            if idx in drop_at:
+                fixes.append(_row(stem, idx, "drop_line", text, ""))
+                continue
+            if idx in clip_at:
+                try:
+                    parsed = parse_yolo_line(text)
+                except ValueError:
+                    fixes.append(_row(stem, idx, "drop_line", text, ""))
+                    continue
+                clipped = _clip(*parsed)
+                if clipped is None:
+                    fixes.append(_row(stem, idx, "drop_line", text, ""))
+                    continue
+                cls, ncx, ncy, nw, nh = clipped
+                after = f"{cls} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                fixes.append(_row(stem, idx, "clip_box", text, after))
+                new_lines.append(after)
+                continue
+            new_lines.append(text)
+        body = "\n".join(new_lines)
+        if raw_lines:
+            body += "\n"
+        lab.write_text(body, encoding="utf-8")
+
+    for issue in errors:
+        if issue.code != "MISSING_LABEL_FILE" or issue.image in removed:
+            continue
+        fixes.append(_row(issue.image, issue.line, "needs_label", "(không có file)", "chuyển người gán"))
+    return fixes
